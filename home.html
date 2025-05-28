@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Voice Agent</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            padding: 20px;
+            background: #f0f0f0;
+        }
+
+        #chat {
+            max-width: 600px;
+            margin: auto;
+            padding: 10px;
+        }
+
+        .message {
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            margin: 5px 0;
+        }
+
+        .partial {
+            opacity: 0.6;
+            font-style: italic;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Real-time Transcription</h2>
+    <div id="chat"></div> <!-- Container for displaying transcriptions -->
+
+    <script>
+        // Audio and WebSocket variables
+        let audioContext, processor, input; // Audio processing variables
+        let ws = null;  // WebSocket connection for real-time transcription
+        let isSpeaking = false; // Flag to track if user is currently speaking
+        let vadTimer = null;    // Timer for Voice Activity Detection (VAD)
+        let audioBuffer = [];   // Buffer to hold audio samples for sending
+
+        // Voice Activity Detection (VAD) and audio settings
+        const VAD_SENSITIVITY = 0.01; // Threshold for detecting speech
+        const VAD_TIMEOUT = 1000;     // Time (ms) to wait before considering speech ended
+        const SAMPLE_RATE = 16000;    // Audio sample rate (Hz)
+
+        // Append a message to the chat area
+        function appendMessage(text, isPartial = false, id = null) {
+            if (!text.trim()) return; // Skip empty/whitespace-only messages
+
+            const chat = document.getElementById('chat');
+            // If updating an existing partial message
+            if (id && document.getElementById(id)) {
+                document.getElementById(id).innerText = text;
+                return;
+            }
+            // Create a new message div
+            const div = document.createElement("div");
+            div.className = "message" + (isPartial ? " partial" : "");
+            div.innerText = text;   // Set the message text
+            if (id) div.id = id;
+            chat.appendChild(div);
+            chat.scrollTop = chat.scrollHeight; // Scroll to bottom
+        }
+
+        // Convert Float32 audio samples to 16-bit PCM
+        function floatTo16BitPCM(float32Array) {
+            const int16 = new Int16Array(float32Array.length);
+            for (let i = 0; i < float32Array.length; i++) {
+                const s = Math.max(-1, Math.min(1, float32Array[i]));   // Clamp to [-1, 1]
+                int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF; // Convert to 16-bit signed integer
+            }
+            return int16;
+        }
+
+        // Send audio data to the server via WebSocket
+        function sendAudio(isFinal = false) {
+            if (!ws || ws.readyState !== WebSocket.OPEN || audioBuffer.length === 0) return;    // Ensure WebSocket is open and buffer is not empty
+
+            const pcm = new Int16Array(audioBuffer);
+            ws.send(pcm.buffer);  // Send as ArrayBuffer
+            if (isFinal) {
+                ws.send(JSON.stringify({ final: true })); // Signal end of utterance
+            }
+
+            audioBuffer = []; // Clear buffer after sending
+        }
+
+        // Start capturing audio and set up WebSocket
+        async function startAudio() {
+            // Request microphone access
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+            input = audioContext.createMediaStreamSource(stream);   // Create audio input from microphone stream
+            processor = audioContext.createScriptProcessor(4096, 1, 1); // Create audio processor for real-time processing
+            input.connect(processor);   // Connect input to processor
+            processor.connect(audioContext.destination);
+
+            // Connect to FastAPI WebSocket endpoint
+            ws = new WebSocket("ws://localhost:8000/api/v1/audio/ws/audio");
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                // Display partial transcription
+                if (data.type === "partial") {
+                    appendMessage(data.text, true, "partial");
+                } else if (data.type === "final") {
+                    // Remove partial and display final transcription
+                    document.getElementById("partial")?.remove();
+                    appendMessage(data.text, false);
+                }
+            };
+
+            // Process audio in real time
+            processor.onaudioprocess = (e) => {
+                const inputData = e.inputBuffer.getChannelData(0); // Get audio samples
+                const max = Math.max(...inputData.map(Math.abs));  // Find max amplitude
+                const pcm = floatTo16BitPCM(inputData);            // Convert to 16-bit PCM
+                audioBuffer.push(...pcm);                          // Add to buffer
+
+                // Voice Activity Detection (VAD)
+                if (max > VAD_SENSITIVITY) {
+                    if (!isSpeaking) isSpeaking = true; // Start of speech
+                    clearTimeout(vadTimer);
+                    vadTimer = setTimeout(() => {
+                        isSpeaking = false;
+                        sendAudio(true); // Send final chunk when speech ends
+                    }, VAD_TIMEOUT);
+                }
+            };
+
+            // Periodically send audio if speaking
+            setInterval(() => {
+                if (isSpeaking) sendAudio(false);
+            }, 2000);
+        }
+
+        // Start everything when the page loads
+        window.onload = () => {
+            startAudio();
+        };
+    </script>
+</body>
+
+</html>
